@@ -14,7 +14,7 @@ permissions: {}
 jobs:
   push:
     if: github.event_name == 'push'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 2
     steps:
       - name: Notificar push
@@ -58,7 +58,7 @@ jobs:
 
   falha:
     if: github.event_name == 'workflow_run' && contains(fromJSON('["failure","timed_out","startup_failure"]'), github.event.workflow_run.conclusion)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 2
     steps:
       - name: Notificar pipeline com falha
