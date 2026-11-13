@@ -1,8 +1,13 @@
-# Alertas Slack — equivalente aos service hooks Slack do Azure DevOps
-# (git.push em qualquer branch + build.complete com falha), migrado em 2026-10-13.
-# Webhook: secret de repositório SLACK_WEBHOOK_URL (plano Free: secret de org não chega a repo privado).
-# Payload Block Kit montado com jq a partir de $GITHUB_EVENT_PATH: nada do evento é interpolado no shell.
-name: Alertas Slack
+# Alertas de push e de falha de pipeline no Slack (#github-oraex) e no Teams (canal github-oraex,
+# equipe ORAEX - Tech). Equivalente aos service hooks do Azure DevOps, migrado em 2026-10-13.
+# Destinos: secrets de repositório SLACK_WEBHOOK_URL e TEAMS_WEBHOOK_URL (plano Free: secret de
+# org não chega a repo privado). Sem um dos secrets, o alerta sai só no outro destino.
+# Cartões montados com jq a partir de $GITHUB_EVENT_PATH: nada do evento é interpolado no shell.
+# Tipos de cartão de push: branch padrão (verde, destaque), tag (roxo, destaque), branch de
+# trabalho (cinza, compacto), criação e remoção (uma linha). Merge da branch padrão para dentro
+# de uma branch de trabalho não gera alerta.
+# Os programas jq ficam entre aspas simples do shell: não usar apóstrofo dentro deles.
+name: Alertas Slack e Teams
 
 on:
   push:
@@ -20,41 +25,139 @@ jobs:
       - name: Notificar push
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
         run: |
-          payload=$(jq -c '
+          alerta="$RUNNER_TEMP/alerta.json"
+          jq -c '
             def esc: gsub("&"; "&amp;") | gsub("<"; "&lt;") | gsub(">"; "&gt;");
+            def titulo: split("\n")[0] | if length > 140 then .[0:137] + "…" else . end;
+            # "(#159)" no título vira link para o PR (só no Slack).
+            def prs($base): gsub("\\(#(?<n>[0-9]+)\\)"; "(<\($base)/pull/\(.n)|#\(.n)>)");
+            # Merge da branch padrão para dentro de outra branch (git merge, "Update branch" do
+            # GitHub ou "Merge de master em ..."): não traz trabalho novo da branch.
+            def sincroniza($padrao):
+              ([titulo | capture("^Merge (?:de |branch \\W?|remote-tracking branch \\W?(?:origin/)?)(?<b>[^\\s\\x27\"]+)")] | first) as $m
+              | $m != null and $m.b == $padrao;
+            def run($t): {type: "TextRun", text: $t};
+            def link($t; $u): {type: "TextRun", text: $t, selectAction: {type: "Action.OpenUrl", url: $u}};
+            def preenchidos: map(select(.text != ""));
+
             .repository as $repo
             | (.ref | sub("^refs/(heads|tags)/"; "")) as $ref
-            | (if (.ref | startswith("refs/tags/")) then "tag" else "branch" end) as $tipo
+            | (.ref | startswith("refs/tags/")) as $tag
+            | (if $tag then "tag" else "branch" end) as $tipo
+            | (($tag | not) and $ref == $repo.default_branch) as $principal
             # Só commits novos no repositório: num merge de PR os commits da branch já foram
             # anunciados no push dela (distinct=false); só o commit de merge é novidade.
             | [(.commits // [])[] | select(.distinct)] as $novos
             | (if ($novos | length) > 0 then $novos
                elif .head_commit and (.deleted | not) and (.created | not) then [.head_commit]
-               else [] end) as $commits
+               else [] end) as $todos
+            | (if $principal or $tag then $todos
+               else [$todos[] | select(.message | sincroniza($repo.default_branch) | not)] end) as $commits
             | ($commits | length) as $n
-            | (if .deleted then ":wastebasket: removeu \($tipo) `\($ref | esc)`"
-               elif .created and $n == 0 then ":sparkles: criou \($tipo) `\($ref | esc)`"
-               else ":heavy_plus_sign: \($n) commit\(if $n == 1 then "" else "s" end) em `\($ref | esc)`" end) as $resumo
-            | ([$commits[-5:][] | "<\(.url)|\(.id[0:7])>  \(.message | split("\n")[0] | esc)  _\(.author.name | esc)_"]
-               + (if $n > 5 then ["_… e mais \($n - 5)_"] else [] end) | join("\n")) as $lista
-            | (.sender.login // .pusher.name) as $autor
-            | {
-                attachments: [{
-                  color: "#1E74C8",
-                  fallback: "\($repo.full_name): \($autor) \($resumo)",
-                  blocks: ([
-                    {type: "section", text: {type: "mrkdwn", text: "*<\($repo.html_url)|\($repo.full_name)>*  ·  \($resumo)"}}
-                  ]
-                  + (if $lista == "" then [] else [{type: "section", text: {type: "mrkdwn", text: $lista}}] end)
-                  + [{type: "context", elements: [
-                      {type: "image", image_url: .sender.avatar_url, alt_text: $autor},
-                      {type: "mrkdwn", text: "*\($autor)*  ·  <\(.compare)|Ver diff>  ·  <\($repo.html_url)/tree/\($ref)|Abrir \($tipo)>"}
-                    ]}])
-                }]
-              }
-          ' "$GITHUB_EVENT_PATH")
-          curl -fsS -X POST -H 'Content-Type: application/json' --data "$payload" "$SLACK_WEBHOOK_URL"
+            | (if .deleted then "removida"
+               elif $n > 0 then (if $principal then "principal" elif $tag then "tag" else "trabalho" end)
+               elif ($todos | length) > 0 then "sincronizacao"
+               elif .created then "criada"
+               else "vazio" end) as $caso
+            | if $caso == "sincronizacao" or $caso == "vazio" then null else
+                (if $caso == "principal" then {destaque: true, cor: "#2EB67D", emoji: ":large_green_circle:", uni: "🟢", estilo: "good"}
+                 elif $tag and $caso != "removida" then {destaque: true, cor: "#7C3AED", emoji: ":label:", uni: "🏷️", estilo: "accent"}
+                 elif $caso == "trabalho" then {destaque: false, cor: "#B0B8C1", emoji: ":seedling:", uni: "🌱"}
+                 elif $caso == "criada" then {destaque: false, cor: "#B0B8C1", emoji: ":sparkles:", uni: "✨"}
+                 else {destaque: false, cor: "#B0B8C1", emoji: ":wastebasket:", uni: "🗑️"} end) as $v
+                | (if $caso == "criada" and $tag and .head_commit then [.head_commit] else $commits end) as $mostrar
+                | ($mostrar | length) as $total
+                | (if $caso == "removida" or $caso == "criada" then {antes: "\($tipo) ", depois: " \($caso)"}
+                   else {antes: "\($n) commit\(if $n == 1 then "" else "s" end) em ", depois: ""} end) as $r
+                | (.sender.login // .pusher.name) as $autor
+                | "\($repo.html_url)/tree/\($ref)" as $url_ref
+                | ([{t: "Ver diff", u: .compare, se: ($caso != "removida" and $caso != "criada")},
+                    {t: "Abrir \($tipo)", u: $url_ref, se: ($caso != "removida")}]
+                   | map(select(.se))) as $links
+                | "\($r.antes)`\($ref | esc)`\($r.depois)" as $resumo
+                | ([$mostrar[-5:][] | "<\(.url)|\(.id[0:7])>  \(.message | titulo | esc | prs($repo.html_url))  _\(.author.name | esc)_"]
+                   + (if $total > 5 then ["_… e mais \($total - 5)_"] else [] end) | join("\n")) as $lista
+                | ($links | map("  ·  <\(.u)|\(.t)>") | join("")) as $links_slack
+                | ($links | map([run("  ·  "), link(.t; .u)]) | add // []) as $links_teams
+                | {
+                    slack: {
+                      attachments: [{
+                        color: $v.cor,
+                        fallback: "\($repo.full_name): \($autor) · \($r.antes)\($ref)\($r.depois)",
+                        blocks: (if $v.destaque then
+                          [{type: "section", text: {type: "mrkdwn", text: "*<\($repo.html_url)|\($repo.full_name)>*  ·  \($v.emoji) *\($resumo)*"}}]
+                          + (if $lista == "" then [] else [{type: "section", text: {type: "mrkdwn", text: $lista}}] end)
+                          + [{type: "context", elements: [
+                              {type: "image", image_url: .sender.avatar_url, alt_text: $autor},
+                              {type: "mrkdwn", text: "*\($autor)*\($links_slack)"}
+                            ]}]
+                        else
+                          [{type: "context", elements: [
+                              {type: "image", image_url: .sender.avatar_url, alt_text: $autor},
+                              {type: "mrkdwn", text: "*<\($repo.html_url)|\($repo.full_name)>*  ·  \($v.emoji) \($resumo)  ·  \($autor)\($links_slack)"}
+                            ]}]
+                          + (if $lista == "" then [] else [{type: "context", elements: [{type: "mrkdwn", text: $lista}]}] end)
+                        end)
+                      }]
+                    },
+                    teams: {
+                      type: "message",
+                      attachments: [{
+                        contentType: "application/vnd.microsoft.card.adaptive",
+                        contentUrl: null,
+                        content: {
+                          "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                          type: "AdaptiveCard",
+                          version: "1.4",
+                          msteams: {width: "Full"},
+                          body: (
+                            ([link($repo.full_name; $repo.html_url) + {weight: "Bolder"},
+                              run("  ·  \($v.uni) \($r.antes)"),
+                              run($ref) + {fontType: "Monospace"} + (if $v.destaque then {weight: "Bolder"} else {} end),
+                              run($r.depois)]
+                             + (if $v.destaque then [] else [run("  ·  \($autor)")] + $links_teams end)
+                             | preenchidos) as $cabecalho
+                            | ([$mostrar[-5:][] | {type: "RichTextBlock", spacing: "Small", inlines: (
+                                  [link(.id[0:7]; .url) + {fontType: "Monospace"},
+                                   run("  \(.message | titulo)"),
+                                   run("  \(.author.name)") + {italic: true, isSubtle: true}]
+                                  | if $v.destaque then . else map(. + {size: "Small"}) end)}]
+                               + (if $total > 5 then [{type: "TextBlock", text: "… e mais \($total - 5)", isSubtle: true, size: "Small", spacing: "Small"}] else [] end)) as $linhas
+                            | if $v.destaque then
+                                [{type: "Container", style: $v.estilo, bleed: true, items: [{type: "RichTextBlock", inlines: $cabecalho}]}]
+                                + $linhas
+                                + [{type: "RichTextBlock", spacing: "Medium", inlines: (
+                                    [run($autor) + {weight: "Bolder"}] + $links_teams | map(. + {size: "Small"}))}]
+                              else
+                                [{type: "RichTextBlock", inlines: $cabecalho}] + $linhas
+                              end
+                          )
+                        }
+                      }]
+                    }
+                  }
+              end
+          ' "$GITHUB_EVENT_PATH" > "$alerta"
+          if [ "$(cat "$alerta")" = null ]; then
+            echo "Push sem novidade para avisar: só merge da branch padrão ou nenhum commit novo."
+            exit 0
+          fi
+          enviar() { # enviar <destino> <chave do cartão> <endereço>
+            [ -n "$3" ] || { echo "$1: sem secret de destino neste repositório; pulado"; return 0; }
+            if jq -c ".$2" "$alerta" | curl -fsS --retry 2 --max-time 20 -o /dev/null -X POST -H "Content-Type: application/json" --data @- "$3"; then
+              echo "$1: entregue"
+            else
+              echo "::error::$1: falha na entrega do alerta"
+              return 1
+            fi
+          }
+          rc=0
+          enviar Slack slack "$SLACK_WEBHOOK_URL" || rc=1
+          enviar Teams teams "$TEAMS_WEBHOOK_URL" || rc=1
+          [ -n "$SLACK_WEBHOOK_URL$TEAMS_WEBHOOK_URL" ] || { echo "::error::nenhum destino configurado (SLACK_WEBHOOK_URL ou TEAMS_WEBHOOK_URL)"; rc=1; }
+          exit "$rc"
 
   falha:
     if: github.event_name == 'workflow_run' && contains(fromJSON('["failure","timed_out","startup_failure"]'), github.event.workflow_run.conclusion)
@@ -64,31 +167,89 @@ jobs:
       - name: Notificar pipeline com falha
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
         run: |
-          payload=$(jq -c '
+          alerta="$RUNNER_TEMP/alerta.json"
+          jq -c '
             def esc: gsub("&"; "&amp;") | gsub("<"; "&lt;") | gsub(">"; "&gt;");
+            def titulo: split("\n")[0] | if length > 140 then .[0:137] + "…" else . end;
+            def run($t): {type: "TextRun", text: $t};
+            def link($t; $u): {type: "TextRun", text: $t, selectAction: {type: "Action.OpenUrl", url: $u}};
+
             .workflow_run as $r
             | .repository as $repo
             | ((($r.updated_at | fromdateiso8601) - ($r.run_started_at | fromdateiso8601)) as $s | "\($s / 60 | floor)m\($s % 60)s") as $duracao
             | ($r.triggering_actor.login // $r.actor.login) as $autor
+            | ($r.head_branch // "sem branch") as $branch
+            | ($r.head_commit.message // "" | titulo) as $mensagem
+            | "\($repo.html_url)/commit/\($r.head_sha)" as $url_commit
             | {
-                attachments: [{
-                  color: "#E01E5A",
-                  fallback: "Pipeline falhou: \($r.name) em \($repo.full_name) (\($r.head_branch))",
-                  blocks: [
-                    {type: "section", text: {type: "mrkdwn", text: ":x: *<\($r.html_url)|\($r.name | esc) #\($r.run_number)>* falhou em *<\($repo.html_url)|\($repo.full_name)>*"}},
-                    {type: "section", fields: [
-                      {type: "mrkdwn", text: "*Branch*\n`\($r.head_branch | esc)`"},
-                      {type: "mrkdwn", text: "*Gatilho*\n`\($r.event)`"},
-                      {type: "mrkdwn", text: "*Resultado*\n`\($r.conclusion)`"},
-                      {type: "mrkdwn", text: "*Duração*\n\($duracao)"}
-                    ]},
-                    {type: "context", elements: [
-                      {type: "image", image_url: ($r.triggering_actor.avatar_url // $r.actor.avatar_url), alt_text: $autor},
-                      {type: "mrkdwn", text: "*\($autor)*  ·  <\($repo.html_url)/commit/\($r.head_sha)|\($r.head_sha[0:7])> \($r.head_commit.message // "" | split("\n")[0] | esc)  ·  <\($r.html_url)|Abrir logs>"}
-                    ]}
-                  ]
-                }]
+                slack: {
+                  attachments: [{
+                    color: "#E01E5A",
+                    fallback: "Pipeline falhou: \($r.name) em \($repo.full_name) (\($branch))",
+                    blocks: [
+                      {type: "section", text: {type: "mrkdwn", text: ":x: *<\($r.html_url)|\($r.name | esc) #\($r.run_number)>* falhou em *<\($repo.html_url)|\($repo.full_name)>*"}},
+                      {type: "section", fields: [
+                        {type: "mrkdwn", text: "*Branch*\n`\($branch | esc)`"},
+                        {type: "mrkdwn", text: "*Gatilho*\n`\($r.event)`"},
+                        {type: "mrkdwn", text: "*Resultado*\n`\($r.conclusion)`"},
+                        {type: "mrkdwn", text: "*Duração*\n\($duracao)"}
+                      ]},
+                      {type: "context", elements: [
+                        {type: "image", image_url: ($r.triggering_actor.avatar_url // $r.actor.avatar_url), alt_text: $autor},
+                        {type: "mrkdwn", text: "*\($autor)*  ·  <\($url_commit)|\($r.head_sha[0:7])> \($mensagem | esc)  ·  <\($r.html_url)|Abrir logs>"}
+                      ]}
+                    ]
+                  }]
+                },
+                teams: {
+                  type: "message",
+                  attachments: [{
+                    contentType: "application/vnd.microsoft.card.adaptive",
+                    contentUrl: null,
+                    content: {
+                      "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                      type: "AdaptiveCard",
+                      version: "1.4",
+                      msteams: {width: "Full"},
+                      body: [
+                        {type: "Container", style: "attention", bleed: true, items: [{type: "RichTextBlock", inlines: [
+                          run("❌ "),
+                          link("\($r.name) #\($r.run_number)"; $r.html_url) + {weight: "Bolder"},
+                          run(" falhou em "),
+                          link($repo.full_name; $repo.html_url) + {weight: "Bolder"}
+                        ]}]},
+                        {type: "RichTextBlock", inlines: [
+                          run("Branch ") + {isSubtle: true}, run($branch) + {fontType: "Monospace"},
+                          run("  ·  Gatilho ") + {isSubtle: true}, run($r.event) + {fontType: "Monospace"},
+                          run("  ·  Resultado ") + {isSubtle: true}, run($r.conclusion) + {fontType: "Monospace"},
+                          run("  ·  Duração ") + {isSubtle: true}, run($duracao)
+                        ]},
+                        {type: "RichTextBlock", spacing: "Small", inlines: ([
+                          run($autor) + {weight: "Bolder"},
+                          run("  ·  "),
+                          link($r.head_sha[0:7]; $url_commit) + {fontType: "Monospace"},
+                          run("  \($mensagem)")
+                        ] | map(. + {size: "Small"}))}
+                      ],
+                      actions: [{type: "Action.OpenUrl", title: "Abrir logs", url: $r.html_url}]
+                    }
+                  }]
+                }
               }
-          ' "$GITHUB_EVENT_PATH")
-          curl -fsS -X POST -H 'Content-Type: application/json' --data "$payload" "$SLACK_WEBHOOK_URL"
+          ' "$GITHUB_EVENT_PATH" > "$alerta"
+          enviar() { # enviar <destino> <chave do cartão> <endereço>
+            [ -n "$3" ] || { echo "$1: sem secret de destino neste repositório; pulado"; return 0; }
+            if jq -c ".$2" "$alerta" | curl -fsS --retry 2 --max-time 20 -o /dev/null -X POST -H "Content-Type: application/json" --data @- "$3"; then
+              echo "$1: entregue"
+            else
+              echo "::error::$1: falha na entrega do alerta"
+              return 1
+            fi
+          }
+          rc=0
+          enviar Slack slack "$SLACK_WEBHOOK_URL" || rc=1
+          enviar Teams teams "$TEAMS_WEBHOOK_URL" || rc=1
+          [ -n "$SLACK_WEBHOOK_URL$TEAMS_WEBHOOK_URL" ] || { echo "::error::nenhum destino configurado (SLACK_WEBHOOK_URL ou TEAMS_WEBHOOK_URL)"; rc=1; }
+          exit "$rc"
