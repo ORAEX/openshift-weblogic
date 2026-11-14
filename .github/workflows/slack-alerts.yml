@@ -110,8 +110,8 @@ jobs:
                 | ($mapa | if . == "" then [] else (try (fromjson | map(select(.prefixo and .nome))) catch []) end) as $nomes
                 | ([$arq[][]] | unique) as $fs
                 | ($fs | map(area($nomes)) | group_by(.) | map({nome: .[0], n: length}) | sort_by(-.n)) as $areas
-                | (($areas[0:4] | map(.nome) | join(" · "))
-                   + (if ($areas | length) > 4 then " e mais \(($areas | length) - 4)" else "" end)) as $areas_txt
+                | (($areas[0:3] | map(.nome) | join(" · "))
+                   + (if ($areas | length) > 3 then " e mais \(($areas | length) - 3)" else "" end)) as $areas_txt
                 | ($areas_txt != "") as $tem
                 | (if ($fs | length) > 5 then " e mais \(($fs | length) - 5)" else "" end) as $fs_resto
                 | {
@@ -125,7 +125,7 @@ jobs:
                               else "*<\($repo.html_url)|\($repo.full_name)>*  ·  \($v.emoji) *\($resumo)*" end)}}]
                           + (if $lista == "" then [] else [{type: "section", text: {type: "mrkdwn", text: $lista}}] end)
                           + (if ($fs | length) == 0 then [] else [{type: "context", elements: [{type: "mrkdwn", text: (
-                              ":page_facing_up: " + ($fs[0:5] | map("`\(. | esc)`") | join("  ")) + (if $fs_resto == "" then "" else "  _\($fs_resto)_" end))}]}] end)
+                              ":page_facing_up: " + ($fs[0:5] | map("`\(. | esc)`") | join("  ")) + (if $fs_resto == "" then "" else "  _\($fs_resto | ltrimstr(" "))_" end))}]}] end)
                           + [{type: "context", elements: [
                               {type: "image", image_url: .sender.avatar_url, alt_text: $autor},
                               {type: "mrkdwn", text: "*\($autor)*\($links_slack)"}
