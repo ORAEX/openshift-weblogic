@@ -6,6 +6,10 @@
 # Tipos de cartão de push: branch padrão (verde, destaque), tag (roxo, destaque), branch de
 # trabalho (cinza, compacto), criação e remoção (uma linha). Merge da branch padrão para dentro
 # de uma branch de trabalho não gera alerta.
+# O cartão diz o que mudou: lê os arquivos de cada commit pela API (por isso contents: read) e
+# mostra a área. Sem a variável de repositório ALERTAS_AREAS a área é a pasta (dois níveis);
+# com ela (JSON [{"prefixo": "admin/k8s/prod", "nome": "Admin produção"}]), o nome do maior
+# prefixo que casa com o arquivo.
 # Os programas jq ficam entre aspas simples do shell: não usar apóstrofo dentro deles.
 name: Alertas Slack e Teams
 
@@ -21,14 +25,19 @@ jobs:
     if: github.event_name == 'push'
     runs-on: ubuntu-24.04
     timeout-minutes: 2
+    permissions:
+      contents: read
     steps:
       - name: Notificar push
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+          ALERTAS_AREAS: ${{ vars.ALERTAS_AREAS }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           alerta="$RUNNER_TEMP/alerta.json"
-          jq -c '
+          arquivos="$RUNNER_TEMP/arquivos.json"
+          programa='
             def esc: gsub("&"; "&amp;") | gsub("<"; "&lt;") | gsub(">"; "&gt;");
             def titulo: split("\n")[0] | if length > 140 then .[0:137] + "…" else . end;
             # "(#159)" no título vira link para o PR (só no Slack).
@@ -38,9 +47,22 @@ jobs:
             def sincroniza($padrao):
               ([titulo | capture("^Merge (?:de |branch \\W?|remote-tracking branch \\W?(?:origin/)?)(?<b>[^\\s\\x27\"]+)")] | first) as $m
               | $m != null and $m.b == $padrao;
+            # Área de um arquivo: nome do maior prefixo de ALERTAS_AREAS que casa; sem isso, a
+            # pasta com até dois níveis; arquivo solto na raiz vira "raiz".
+            def area($nomes): . as $f
+              | ([$nomes[] | select(.prefixo as $p | $f == $p or ($f | startswith($p + "/")))] | sort_by(.prefixo | length) | last) as $m
+              | if $m then $m.nome
+                else ($f | split("/") | if length == 1 then "raiz" else .[0:([length - 1, 2] | min)] | join("/") end) end;
+            # Peças do cartão do Teams (Adaptive Card). Texto vindo do evento vai sempre em TextRun,
+            # que não interpreta markdown.
             def run($t): {type: "TextRun", text: $t};
             def link($t; $u): {type: "TextRun", text: $t, selectAction: {type: "Action.OpenUrl", url: $u}};
             def preenchidos: map(select(.text != ""));
+            def rtb($inl): {type: "RichTextBlock", inlines: ($inl | preenchidos)};
+            def pequeno: map(. + {size: "Small"});
+            def coluna($largura; $itens): {type: "Column", width: $largura, verticalContentAlignment: "Center", items: $itens};
+            def foto($url; $nome; $px): if $url then [coluna("auto"; [{type: "Image", url: $url, style: "Person", width: $px, altText: $nome}])] else [] end;
+            def botao($t; $u): {type: "Action.OpenUrl", title: $t, url: $u};
 
             .repository as $repo
             | (.ref | sub("^refs/(heads|tags)/"; "")) as $ref
@@ -61,7 +83,10 @@ jobs:
                elif ($todos | length) > 0 then "sincronizacao"
                elif .created then "criada"
                else "vazio" end) as $caso
-            | if $caso == "sincronizacao" or $caso == "vazio" then null else
+            | if $modo == "shas" then
+                # Commits cujos arquivos o passo busca na API (os 10 mais recentes do push).
+                (if $caso == "principal" or $caso == "trabalho" then $commits[-10:][].id | select(test("^[0-9a-f]{40}$")) else empty end)
+              elif $caso == "sincronizacao" or $caso == "vazio" then null else
                 (if $caso == "principal" then {destaque: true, cor: "#2EB67D", emoji: ":large_green_circle:", uni: "🟢", estilo: "good"}
                  elif $tag and $caso != "removida" then {destaque: true, cor: "#7C3AED", emoji: ":label:", uni: "🏷️", estilo: "accent"}
                  elif $caso == "trabalho" then {destaque: false, cor: "#B0B8C1", emoji: ":seedling:", uni: "🌱"}
@@ -81,24 +106,49 @@ jobs:
                    + (if $total > 5 then ["_… e mais \($total - 5)_"] else [] end) | join("\n")) as $lista
                 | ($links | map("  ·  <\(.u)|\(.t)>") | join("")) as $links_slack
                 | ($links | map([run("  ·  "), link(.t; .u)]) | add // []) as $links_teams
+                # O que mudou: arquivos dos commits (lidos pela API) agrupados por área.
+                | ($mapa | if . == "" then [] else (try (fromjson | map(select(.prefixo and .nome))) catch []) end) as $nomes
+                | ([$arq[][]] | unique) as $fs
+                | ($fs | map(area($nomes)) | group_by(.) | map({nome: .[0], n: length}) | sort_by(-.n)) as $areas
+                | (($areas[0:4] | map(.nome) | join(" · "))
+                   + (if ($areas | length) > 4 then " e mais \(($areas | length) - 4)" else "" end)) as $areas_txt
+                | ($areas_txt != "") as $tem
+                | (if ($fs | length) > 5 then " e mais \(($fs | length) - 5)" else "" end) as $fs_resto
                 | {
                     slack: {
                       attachments: [{
                         color: $v.cor,
-                        fallback: "\($repo.full_name): \($autor) · \($r.antes)\($ref)\($r.depois)",
+                        fallback: ("\($repo.full_name): " + (if $tem then "\($areas_txt) · " else "" end) + "\($autor) · \($r.antes)\($ref)\($r.depois)"),
                         blocks: (if $v.destaque then
-                          [{type: "section", text: {type: "mrkdwn", text: "*<\($repo.html_url)|\($repo.full_name)>*  ·  \($v.emoji) *\($resumo)*"}}]
+                          [{type: "section", text: {type: "mrkdwn", text: (
+                              if $tem then "\($v.emoji) *\($areas_txt | esc)*\n*<\($repo.html_url)|\($repo.full_name)>*  ·  *\($resumo)*"
+                              else "*<\($repo.html_url)|\($repo.full_name)>*  ·  \($v.emoji) *\($resumo)*" end)}}]
                           + (if $lista == "" then [] else [{type: "section", text: {type: "mrkdwn", text: $lista}}] end)
+                          + (if ($fs | length) == 0 then [] else [{type: "context", elements: [{type: "mrkdwn", text: (
+                              ":page_facing_up: " + ($fs[0:5] | map("`\(. | esc)`") | join("  ")) + (if $fs_resto == "" then "" else "  _\($fs_resto)_" end))}]}] end)
                           + [{type: "context", elements: [
                               {type: "image", image_url: .sender.avatar_url, alt_text: $autor},
                               {type: "mrkdwn", text: "*\($autor)*\($links_slack)"}
                             ]}]
                         else
-                          [{type: "context", elements: [
-                              {type: "image", image_url: .sender.avatar_url, alt_text: $autor},
-                              {type: "mrkdwn", text: "*<\($repo.html_url)|\($repo.full_name)>*  ·  \($v.emoji) \($resumo)  ·  \($autor)\($links_slack)"}
-                            ]}]
-                          + (if $lista == "" then [] else [{type: "context", elements: [{type: "mrkdwn", text: $lista}]}] end)
+                          # Branch de trabalho: a primeira linha (o que mudou e em qual repositório)
+                          # em tamanho normal; commits e autor em texto pequeno. Criação e remoção
+                          # ficam em uma linha pequena.
+                          ((if $tem then "\($v.emoji) *\($areas_txt | esc)*  ·  *<\($repo.html_url)|\($repo.full_name)>*  ·  \($resumo)"
+                            else "*<\($repo.html_url)|\($repo.full_name)>*  ·  \($v.emoji) \($resumo)" end)) as $linha
+                          | if $caso == "trabalho" then
+                              [{type: "section", text: {type: "mrkdwn", text: $linha}}]
+                              + (if $lista == "" then [] else [{type: "context", elements: [{type: "mrkdwn", text: $lista}]}] end)
+                              + [{type: "context", elements: [
+                                  {type: "image", image_url: .sender.avatar_url, alt_text: $autor},
+                                  {type: "mrkdwn", text: "*\($autor)*\($links_slack)"}
+                                ]}]
+                            else
+                              [{type: "context", elements: [
+                                  {type: "image", image_url: .sender.avatar_url, alt_text: $autor},
+                                  {type: "mrkdwn", text: "\($linha)  ·  \($autor)\($links_slack)"}
+                                ]}]
+                            end
                         end)
                       }]
                     },
@@ -107,39 +157,60 @@ jobs:
                       attachments: [{
                         contentType: "application/vnd.microsoft.card.adaptive",
                         contentUrl: null,
-                        content: {
+                        content: ({
                           "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
                           type: "AdaptiveCard",
                           version: "1.4",
                           msteams: {width: "Full"},
                           body: (
-                            ([link($repo.full_name; $repo.html_url) + {weight: "Bolder"},
-                              run("  ·  \($v.uni) \($r.antes)"),
-                              run($ref) + {fontType: "Monospace"} + (if $v.destaque then {weight: "Bolder"} else {} end),
-                              run($r.depois)]
-                             + (if $v.destaque then [] else [run("  ·  \($autor)")] + $links_teams end)
-                             | preenchidos) as $cabecalho
-                            | ([$mostrar[-5:][] | {type: "RichTextBlock", spacing: "Small", inlines: (
-                                  [link(.id[0:7]; .url) + {fontType: "Monospace"},
-                                   run("  \(.message | titulo)"),
-                                   run("  \(.author.name)") + {italic: true, isSubtle: true}]
-                                  | if $v.destaque then . else map(. + {size: "Small"}) end)}]
-                               + (if $total > 5 then [{type: "TextBlock", text: "… e mais \($total - 5)", isSubtle: true, size: "Small", spacing: "Small"}] else [] end)) as $linhas
-                            | if $v.destaque then
-                                [{type: "Container", style: $v.estilo, bleed: true, items: [{type: "RichTextBlock", inlines: $cabecalho}]}]
-                                + $linhas
-                                + [{type: "RichTextBlock", spacing: "Medium", inlines: (
-                                    [run($autor) + {weight: "Bolder"}] + $links_teams | map(. + {size: "Small"}))}]
+                            # Evento em uma frase: "master · 2 commits" ou "branch feat/x criada".
+                            (run($ref) + {fontType: "Monospace", weight: "Bolder"}) as $ref_run
+                            | (if $caso == "removida" or $caso == "criada" then [run("\($tipo) "), $ref_run, run(" \($caso)")]
+                               else [$ref_run, run("  ·  \($n) commit\(if $n == 1 then "" else "s" end)")] end) as $evento
+                            | (if $v.destaque then {size: "Large"} else {} end) as $tam
+                            | (if $tem then [run("\($v.uni)  \($areas_txt)") + {weight: "Bolder"} + $tam]
+                               else [run("\($v.uni)  "), link($repo.full_name; $repo.html_url) + {weight: "Bolder"} + $tam] end) as $titulo_teams
+                            | ((if $tem then [link($repo.full_name; $repo.html_url), run("  ·  ")] else [] end)
+                               + $evento + [run("  ·  \($autor)")] | pequeno) as $sub
+                            | ([$mostrar[-5:][] | {type: "ColumnSet", spacing: "Small", columns: [
+                                  {type: "Column", width: "auto", items: [rtb([link(.id[0:7]; .url) + {fontType: "Monospace"}] | if $v.destaque then . else pequeno end)]},
+                                  {type: "Column", width: "stretch", items: [rtb([run(.message | titulo), run("   \(.author.name)") + {italic: true, isSubtle: true}] | if $v.destaque then . else pequeno end)]}
+                                ]}]
+                               + (if $total > 5 then [rtb([run("… e mais \($total - 5)") + {isSubtle: true}] | pequeno) + {spacing: "Small"}] else [] end)) as $linhas
+                            | if $caso == "criada" and ($tag | not) or $caso == "removida" then
+                                # Criação e remoção de branch: uma linha.
+                                [{type: "ColumnSet", columns: (foto(.sender.avatar_url; $autor; "24px") + [coluna("stretch"; [rtb(
+                                    [link($repo.full_name; $repo.html_url) + {weight: "Bolder"}, run("  ·  \($v.uni) ")] + $evento + [run("  ·  \($autor)")] + $links_teams)])])}]
                               else
-                                [{type: "RichTextBlock", inlines: $cabecalho}] + $linhas
+                                [{type: "Container", style: (if $v.destaque then $v.estilo else "emphasis" end), bleed: true, items: [
+                                    {type: "ColumnSet", columns: (foto(.sender.avatar_url; $autor; (if $v.destaque then "36px" else "28px" end))
+                                      + [coluna("stretch"; [rtb($titulo_teams), rtb($sub) + {spacing: "None"}])])}]}]
+                                + $linhas
+                                + (if $v.destaque and ($fs | length) > 0 then [rtb([run("📄  " + ($fs[0:5] | join("    ")) + $fs_resto) + {size: "Small", isSubtle: true, fontType: "Monospace"}]) + {spacing: "Medium"}] else [] end)
+                                + (if $v.destaque then [] else [rtb($links_teams[1:] | pequeno) + {spacing: "Small"}] end)
                               end
                           )
                         }
+                        + (if $v.destaque then
+                            # Botões só nos cartões em destaque: PR (quando o título termina em "(#N)"), diff e branch ou tag.
+                            ((if $total > 0 then ([$mostrar[-1].message | titulo | capture("\\(#(?<n>[0-9]+)\\)\\s*$")] | first | .n?) else null end) as $pr
+                             | {actions: ((if $pr then [botao("Abrir PR #\($pr)"; "\($repo.html_url)/pull/\($pr)")] else [] end)
+                                          + ($links | map(botao(.t; .u))))})
+                           else {} end))
                       }]
                     }
                   }
               end
-          ' "$GITHUB_EVENT_PATH" > "$alerta"
+          '
+          # Arquivos de cada commit avisado, pela API. Falha aqui não segura o alerta: o cartão
+          # sai sem a área.
+          : > "$arquivos"
+          for sha in $(jq -r --arg modo shas --arg mapa "" --slurpfile arq "$arquivos" "$programa" "$GITHUB_EVENT_PATH"); do
+            curl -fsS --retry 2 --max-time 15 -H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/vnd.github+json" \
+              "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/commits/$sha" | jq -c "[.files[]?.filename]" >> "$arquivos" \
+              || echo "::warning::sem a lista de arquivos do commit $sha; o cartão sai sem a área"
+          done
+          jq -c --arg modo cartao --arg mapa "$ALERTAS_AREAS" --slurpfile arq "$arquivos" "$programa" "$GITHUB_EVENT_PATH" > "$alerta"
           if [ "$(cat "$alerta")" = null ]; then
             echo "Push sem novidade para avisar: só merge da branch padrão ou nenhum commit novo."
             exit 0
@@ -175,6 +246,12 @@ jobs:
             def titulo: split("\n")[0] | if length > 140 then .[0:137] + "…" else . end;
             def run($t): {type: "TextRun", text: $t};
             def link($t; $u): {type: "TextRun", text: $t, selectAction: {type: "Action.OpenUrl", url: $u}};
+            def rtb($inl): {type: "RichTextBlock", inlines: $inl};
+            def pequeno: map(. + {size: "Small"});
+            def coluna($largura; $itens): {type: "Column", width: $largura, verticalContentAlignment: "Center", items: $itens};
+            def foto($url; $nome; $px): if $url then [coluna("auto"; [{type: "Image", url: $url, style: "Person", width: $px, altText: $nome}])] else [] end;
+            def dado($rotulo; $valor): {type: "Column", width: "auto", spacing: "ExtraLarge", items: [
+              rtb([run($rotulo) + {isSubtle: true}] | pequeno), rtb([run($valor) + {weight: "Bolder"}]) + {spacing: "None"}]};
 
             .workflow_run as $r
             | .repository as $repo
@@ -214,26 +291,19 @@ jobs:
                       version: "1.4",
                       msteams: {width: "Full"},
                       body: [
-                        {type: "Container", style: "attention", bleed: true, items: [{type: "RichTextBlock", inlines: [
-                          run("❌ "),
-                          link("\($r.name) #\($r.run_number)"; $r.html_url) + {weight: "Bolder"},
-                          run(" falhou em "),
-                          link($repo.full_name; $repo.html_url) + {weight: "Bolder"}
-                        ]}]},
-                        {type: "RichTextBlock", inlines: [
-                          run("Branch ") + {isSubtle: true}, run($branch) + {fontType: "Monospace"},
-                          run("  ·  Gatilho ") + {isSubtle: true}, run($r.event) + {fontType: "Monospace"},
-                          run("  ·  Resultado ") + {isSubtle: true}, run($r.conclusion) + {fontType: "Monospace"},
-                          run("  ·  Duração ") + {isSubtle: true}, run($duracao)
-                        ]},
-                        {type: "RichTextBlock", spacing: "Small", inlines: ([
-                          run($autor) + {weight: "Bolder"},
-                          run("  ·  "),
-                          link($r.head_sha[0:7]; $url_commit) + {fontType: "Monospace"},
-                          run("  \($mensagem)")
-                        ] | map(. + {size: "Small"}))}
+                        {type: "Container", style: "attention", bleed: true, items: [
+                          {type: "ColumnSet", columns: (foto(($r.triggering_actor.avatar_url // $r.actor.avatar_url); $autor; "36px")
+                            + [coluna("stretch"; [
+                                rtb([run("❌  "), link("\($r.name) #\($r.run_number)"; $r.html_url) + {weight: "Bolder", size: "Large"}, run("  falhou") + {weight: "Bolder", size: "Large"}]),
+                                rtb([link($repo.full_name; $repo.html_url), run("  ·  "), run($branch) + {fontType: "Monospace", weight: "Bolder"}, run("  ·  \($autor)")] | pequeno) + {spacing: "None"}
+                              ])])}]},
+                        {type: "ColumnSet", spacing: "Medium", columns: [
+                          dado("Resultado"; $r.conclusion), dado("Gatilho"; $r.event), dado("Duração"; $duracao)]},
+                        {type: "ColumnSet", spacing: "Medium", columns: [
+                          {type: "Column", width: "auto", items: [rtb([link($r.head_sha[0:7]; $url_commit) + {fontType: "Monospace"}])]},
+                          {type: "Column", width: "stretch", items: [rtb([run($mensagem)])]}]}
                       ],
-                      actions: [{type: "Action.OpenUrl", title: "Abrir logs", url: $r.html_url}]
+                      actions: [{type: "Action.OpenUrl", title: "Abrir logs", url: $r.html_url}, {type: "Action.OpenUrl", title: "Ver commit", url: $url_commit}]
                     }
                   }]
                 }
